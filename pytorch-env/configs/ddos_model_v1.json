@@ -1,0 +1,11 @@
+{
+    "timestamp": "2026-03-21T01:15:58.947827",
+    "config_name": "ddos_model_v1",
+    "EMBED_DIM": 64,
+    "NUM_HEADS": 4,
+    "NUM_CNN_LAYERS": 2,
+    "BATCH_SIZE": 1024,
+    "EPOCHS": 50,
+    "PATIENCE": 7,
+    "LR": 0.0003
+}
