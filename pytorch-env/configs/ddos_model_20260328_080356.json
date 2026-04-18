@@ -1,0 +1,20 @@
+{
+    "timestamp": "2026-03-28T08:03:56.466136",
+    "config_name": "ddos_model_20260328_080356",
+    "EMBED_DIM": 128,
+    "GRID_ROWS": 2,
+    "GRID_COLS": 2,
+    "NUM_CNN_LAYERS": 2,
+    "NUM_TRANSFORMER_LAYERS": 2,
+    "ATTN_DROPOUT": 0.1,
+    "BATCH_SIZE": 512,
+    "EPOCHS": 50,
+    "PATIENCE": 7,
+    "LR": 0.0003,
+    "WEIGHT_DECAY": 0.0001,
+    "MLP_DROPOUT": 0.2,
+    "USE_FOCAL_LOSS": true,
+    "FOCAL_GAMMA": 2.0,
+    "WEIGHTED_SAMPLER": true,
+    "TEST_SPLIT": 0.2
+}
