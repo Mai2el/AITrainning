@@ -530,7 +530,6 @@ if __name__ == "__main__":
         mlflow.log_metric("test_weighted_f1", test_f1)
         mlflow.log_metric("best_val_f1", trainer.best_val_f1)
         
-        # 1. Đưa model về CPU trước khi lưu bằng MLflow để tránh crash do CUDA serialization
         model.cpu()
         mlflow.pytorch.log_model(model, "best_model")
         
