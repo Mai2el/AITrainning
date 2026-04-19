@@ -3,3 +3,4 @@ __pycache__/
 Lib/
 *.txt
 *.md
+pytorch-env/mlruns/
