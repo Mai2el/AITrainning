@@ -42,8 +42,8 @@ X_train, X_test, y_train, y_test = train_test_split(
 
 print(f"Train: {len(X_train)} | Test: {len(X_test)}")
 
-# LƯU Ý: ĐÃ TẮT BƯỚC TÍNH TOÁN SAMPLE_WEIGHT ĐỂ CHỐNG NHIỄU (OVERFITTING LỚP NHỎ)
 
+# LƯU Ý: ĐÃ TẮT BƯỚC TÍNH TOÁN SAMPLE_WEIGHT ĐỂ CHỐNG NHIỄU (OVERFITTING LỚP NHỎ)
 # 4. Model (Multi-class)
 model = xgb.XGBClassifier(
     objective='multi:softprob',     

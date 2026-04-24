@@ -4,3 +4,6 @@ Lib/
 *.txt
 *.md
 pytorch-env/mlruns/
+*.json
+*.csv
+mlruns.db

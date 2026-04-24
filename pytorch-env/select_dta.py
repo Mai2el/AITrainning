@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore")
 
 # ── Features phải giữ lại bất kể correlation hay importance ──────────────
 DDOS_CRITICAL_FEATURES = { 
-    "dst_port", "protocol", # Thêm protocol để hỗ trợ phân biệt IGMP/TCP
+    "dst_port",
     "packets_rate", "fwd_packets_rate", "bwd_packets_rate",
     "bytes_rate", "fwd_bytes_rate", "bwd_bytes_rate", "down_up_rate",
     "packets_IAT_mean", "packet_IAT_std", "packet_IAT_min", "packet_IAT_max",
