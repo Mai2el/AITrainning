@@ -1,12 +1,17 @@
 """
-feature_selection.py  (DDoS-aware version - ENSEMBLE + WHITELIST + RAW DATA PRESERVATION)
+feature_selection_v2.py
 ----------------------------------------------
-Cải tiến:
-  - Chỉ tính toán Feature Selection trên một bản sao tạm thời.
-  - Sử dụng Ensemble Feature Selection: ANOVA, Information Gain, Extra Trees.
-  - Tích hợp Whitelist bảo vệ các tính năng quan trọng và lấy đủ 80 features.
-  - Dữ liệu xuất ra file CSV cuối cùng giữ nguyên 100% trạng thái gốc 
-    (không fillna, giữ nguyên định dạng ban đầu).
+Multi-class (~10 labels) optimized version:
+
+Pipeline:
+  - Variance filter (bỏ constant, giữ mandatory)
+  - Ensemble global (ANOVA + MI + ExtraTrees)
+  - Per-class importance (One-vs-Rest ExtraTrees)
+  - Mandatory + Soft whitelist
+  - Merge + chọn top_k
+
+Giữ nguyên:
+  - Raw data export (không fillna)
 """
 
 import numpy as np
@@ -14,223 +19,257 @@ import pandas as pd
 from sklearn.feature_selection import VarianceThreshold, f_classif, mutual_info_classif
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.model_selection import StratifiedKFold
-import time
 import warnings
 import gc
 
 warnings.filterwarnings("ignore")
 
-# ── Features phải giữ lại bất kể correlation hay importance ──────────────
-DDOS_CRITICAL_FEATURES = { 
-    "dst_port",
-    "packets_rate", "fwd_packets_rate", "bwd_packets_rate",
-    "bytes_rate", "fwd_bytes_rate", "bwd_bytes_rate", "down_up_rate",
-    "packets_IAT_mean", "packet_IAT_std", "packet_IAT_min", "packet_IAT_max",
-    "fwd_packets_IAT_mean", "bwd_packets_IAT_mean",
-    "syn_flag_counts", "ack_flag_counts", "rst_flag_counts", "fin_flag_counts",
-    "fwd_syn_flag_counts", "bwd_syn_flag_counts",
-    "syn_flag_percentage_in_total", "ack_flag_percentage_in_total",
-    "duration", "packets_count", "fwd_packets_count", "bwd_packets_count",
-    "handshake_duration", "handshake_state",
-    "syn_per_packet", "iat_x_rate",
-    "bwd_fwd_ratio", "syn_no_fin", "bytes_per_packet",
+# =========================================================
+# 🔒 MANDATORY (KHÔNG BAO GIỜ BỎ)
+# =========================================================
+DDOS_MANDATORY_FEATURES = {
+    "active_variance",
+    "active_std",
+    "bwd_ack_flag_counts",
+    "fwd_bulk_state_count",
 }
 
-# ── Bước 0: Feature Engineering ──────────────────────────────────────────
+# =========================================================
+# ⚖️ SOFT WHITELIST (NHẸ, KHÔNG BIAS)
+# =========================================================
+DDOS_CRITICAL_FEATURES = {
+    "dst_port",
+    "packets_rate", "bytes_rate",
+    "syn_flag_counts", "ack_flag_counts",
+    "duration", "packets_count",
+    "bwd_fwd_ratio", "bytes_per_packet",
+}
+
+# =========================================================
+# Feature Engineering
+# =========================================================
 def engineer_ddos_features(df: pd.DataFrame) -> pd.DataFrame:
-    eps = 1e-9  
-    
-    def get_num(col_name):
-        return pd.to_numeric(df[col_name], errors='coerce')
+    eps = 1e-9
+
+    def get_num(col):
+        return pd.to_numeric(df[col], errors='coerce')
 
     if "syn_flag_counts" in df.columns and "packets_count" in df.columns:
         df["syn_per_packet"] = get_num("syn_flag_counts") / (get_num("packets_count") + eps)
-        
-    if "packets_IAT_mean" in df.columns and "packets_rate" in df.columns:
-        df["iat_x_rate"] = get_num("packets_IAT_mean") * get_num("packets_rate")
-        
+
     if "bwd_packets_count" in df.columns and "fwd_packets_count" in df.columns:
-        df["bwd_fwd_ratio"] = (get_num("bwd_packets_count") + eps) / (get_num("fwd_packets_count") + eps)
-        
-    if "syn_flag_counts" in df.columns and "fin_flag_counts" in df.columns:
-        df["syn_no_fin"] = (get_num("syn_flag_counts") - get_num("fin_flag_counts")).clip(lower=0)
-        
+        df["bwd_fwd_ratio"] = (
+            get_num("bwd_packets_count") / (get_num("fwd_packets_count") + 1.0)
+        ).clip(0, 100)
+
     if "bytes_rate" in df.columns and "packets_rate" in df.columns:
         df["bytes_per_packet"] = (get_num("bytes_rate") + eps) / (get_num("packets_rate") + eps)
 
-    new_cols = ["syn_per_packet", "iat_x_rate", "bwd_fwd_ratio", "syn_no_fin", "bytes_per_packet"]
-    added = [c for c in new_cols if c in df.columns]
-    print(f"[engineer_ddos_features] Đã thêm các features tổ hợp: {added}")
+    print("[engineer] Added features: syn_per_packet, bwd_fwd_ratio, bytes_per_packet")
     return df
 
-# ── Selector chính (Ensemble: ANOVA + InfoGain + ExtraTrees) ──────────────
+
+# =========================================================
+# 🔥 FEATURE SELECTOR V2
+# =========================================================
 class FeatureSelector:
-    def __init__(self, top_k=80, cv_folds=5, ddos_whitelist=None):
+    def __init__(self, top_k=60, cv_folds=5):
         self.top_k = top_k
         self.cv_folds = cv_folds
-        self.ddos_whitelist = ddos_whitelist if ddos_whitelist is not None else DDOS_CRITICAL_FEATURES
         self.selected_cols_ = None
 
     def fit_transform(self, X, y, feature_names):
-        print(f"\n{'='*64}")
-        print(f" ENSEMBLE FEATURE SELECTION + WHITELIST (Target: {self.top_k} features)")
-        print(f"{'='*64}")
         cols = list(feature_names)
-        
-        # 0. Variance Filter (Bỏ các cột có giá trị hằng số)
-        print("\n[0] Lọc các features hằng số (Variance = 0)...")
-        var_filter = VarianceThreshold(threshold=0.0)
-        var_filter.fit(X)
-        keep_var = var_filter.get_support()
-        X_cur = X[:, keep_var]
-        cols = [cols[i] for i, k in enumerate(keep_var) if k]
-        ranks = {col: 0 for col in cols}
 
+        print("\n" + "="*70)
+        print(" FEATURE SELECTION V2 (MULTI-CLASS)")
+        print("="*70)
+
+        # -------------------------------------------------
+        # 0. Variance Filter (giữ mandatory)
+        # -------------------------------------------------
+        non_mand_idx = [i for i, c in enumerate(cols) if c not in DDOS_MANDATORY_FEATURES]
+        mand_idx = [i for i, c in enumerate(cols) if c in DDOS_MANDATORY_FEATURES]
+
+        var = VarianceThreshold(0.0)
+        var.fit(X[:, non_mand_idx])
+        keep_non_mand = var.get_support()
+
+        keep = np.zeros(len(cols), dtype=bool)
+
+        for k, i in enumerate(non_mand_idx):
+            keep[i] = keep_non_mand[k]
+        for i in mand_idx:
+            keep[i] = True
+
+        X_cur = X[:, keep]
+        cols = [cols[i] for i, k in enumerate(keep) if k]
+
+        print(f"[Variance] Remaining: {len(cols)} features")
+
+        ranks = {c: 0 for c in cols}
+
+        # -------------------------------------------------
         # 1. ANOVA
-        print("\n[1] Đang tính toán ANOVA (F-Value)...")
+        # -------------------------------------------------
+        print("[ANOVA]")
         f_vals, _ = f_classif(X_cur, y)
-        anova_ranks = np.argsort(np.nan_to_num(f_vals))[::-1]
-        for rank, idx in enumerate(anova_ranks):
-            ranks[cols[idx]] += rank
+        order = np.argsort(np.nan_to_num(f_vals))[::-1]
+        for r, i in enumerate(order):
+            ranks[cols[i]] += r
 
-        # 2. Information Gain
-        print("[2] Đang tính toán Information Gain (Mutual Information)...")
-        sample_size = min(X_cur.shape[0], 50000) 
-        sample_idx = np.random.choice(X_cur.shape[0], sample_size, replace=False)
-        mi_scores = mutual_info_classif(X_cur[sample_idx], y[sample_idx], random_state=42)
-        ig_ranks = np.argsort(np.nan_to_num(mi_scores))[::-1]
-        for rank, idx in enumerate(ig_ranks):
-            ranks[cols[idx]] += rank
+        # -------------------------------------------------
+        # 2. Mutual Information
+        # -------------------------------------------------
+        print("[Mutual Info]")
+        sample_size = min(50000, len(X_cur))
+        idx = np.random.choice(len(X_cur), sample_size, replace=False)
 
-        # 3. Extra Trees
-        print(f"[3] Đang tính toán Extra Trees Importance (CV {self.cv_folds}-Fold)...")
+        mi = mutual_info_classif(X_cur[idx], y[idx], random_state=42)
+        order = np.argsort(np.nan_to_num(mi))[::-1]
+        for r, i in enumerate(order):
+            ranks[cols[i]] += r
+
+        # -------------------------------------------------
+        # 3. Extra Trees (global)
+        # -------------------------------------------------
+        print("[ExtraTrees - Global]")
         skf = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=42)
-        et_importances = np.zeros(len(cols))
-        for fold, (tr_idx, _) in enumerate(skf.split(X_cur, y), 1):
-            clf = ExtraTreesClassifier(n_estimators=100, max_depth=15, n_jobs=-1, random_state=fold)
-            clf.fit(X_cur[tr_idx], y[tr_idx])
-            et_importances += clf.feature_importances_
-        et_ranks = np.argsort(et_importances / self.cv_folds)[::-1]
-        for rank, idx in enumerate(et_ranks):
-            ranks[cols[idx]] += rank
+        et_imp = np.zeros(len(cols))
 
-        # 4. Tích hợp Whitelist & Ensemble Voting
-        print("\n[4] Tiến hành kết hợp Whitelist và kết quả Ensemble...")
-        sorted_by_ensemble = sorted(cols, key=lambda c: ranks[c])
-        
-        whitelist_present = [c for c in self.ddos_whitelist if c in cols]
-        print(f"    ⚑ Đã nhặt {len(whitelist_present)}/{len(self.ddos_whitelist)} features từ Whitelist đưa vào danh sách bảo vệ.")
+        for fold, (tr, _) in enumerate(skf.split(X_cur, y), 1):
+            clf = ExtraTreesClassifier(
+                n_estimators=100,
+                max_depth=15,
+                n_jobs=-1,
+                random_state=fold
+            )
+            clf.fit(X_cur[tr], y[tr])
+            et_imp += clf.feature_importances_
 
-        final_list = list(whitelist_present)
-        
-        for col in sorted_by_ensemble:
-            if len(final_list) >= self.top_k:
+        order = np.argsort(et_imp)[::-1]
+        for r, i in enumerate(order):
+            ranks[cols[i]] += r
+
+        # -------------------------------------------------
+        # 🔥 4. Per-class Importance (QUAN TRỌNG NHẤT)
+        # -------------------------------------------------
+        print("[Per-class Importance]")
+
+        per_class_features = set()
+        unique_classes = np.unique(y)
+
+        for c in unique_classes:
+            print(f"   → Class {c}")
+
+            y_bin = (y == c).astype(int)
+
+            clf = ExtraTreesClassifier(
+                n_estimators=100,
+                max_depth=15,
+                n_jobs=-1,
+                random_state=42
+            )
+            clf.fit(X_cur, y_bin)
+
+            imp = clf.feature_importances_
+            top_idx = np.argsort(imp)[::-1][:10]   # top 10 mỗi class
+
+            for i in top_idx:
+                per_class_features.add(cols[i])
+
+        print(f"   Collected {len(per_class_features)} per-class features")
+
+        # -------------------------------------------------
+        # 5. Merge tất cả
+        # -------------------------------------------------
+        sorted_global = sorted(cols, key=lambda c: ranks[c])
+
+        final = []
+
+        # (1) Mandatory
+        for c in DDOS_MANDATORY_FEATURES:
+            if c in cols:
+                final.append(c)
+
+        # (2) Per-class
+        for c in per_class_features:
+            if c not in final:
+                final.append(c)
+
+        # (3) Soft whitelist
+        for c in DDOS_CRITICAL_FEATURES:
+            if c in cols and c not in final:
+                final.append(c)
+
+        # (4) Fill bằng global ranking
+        for c in sorted_global:
+            if len(final) >= self.top_k:
                 break
-            if col not in final_list:
-                final_list.append(col)
-                
-        self.selected_cols_ = final_list
-        
-        print(f"\n{'='*64}")
-        print(f" ✓ KẾT QUẢ CUỐI CÙNG: Top {len(self.selected_cols_)} features xuất sắc nhất")
-        print(f"{'='*64}\n")
+            if c not in final:
+                final.append(c)
 
-        final_idx = [list(feature_names).index(c) for c in self.selected_cols_]
-        return X[:, final_idx], self.selected_cols_
+        self.selected_cols_ = final[:self.top_k]
 
-# ------------------------------------------------------------------
-# STANDALONE DEMO
-# ------------------------------------------------------------------
+        print("\n" + "="*70)
+        print(f" FINAL SELECTED: {len(self.selected_cols_)} features")
+        print("="*70)
+
+        idx = [feature_names.index(c) for c in self.selected_cols_]
+        return X[:, idx], self.selected_cols_
+
+
+# =========================================================
+# MAIN
+# =========================================================
 if __name__ == "__main__":
-    import gc # Thư viện dọn dẹp RAM
-
-    CSV_PATH  = "dataset_optimized.csv"
+    CSV_PATH = "dataset_optimized.csv"
     LABEL_COL = "activity"
-    # LƯU Ý: Không loại bỏ "dst_port" và "protocol"
-    DROP_COLS = ["label", "flow_id", "timestamp", "src_ip", "dst_ip", "src_port"]  
-    TOP_K     = 80
+    DROP_COLS = ["label", "flow_id", "timestamp", "src_ip", "dst_ip", "src_port"]
+    TOP_K = 60
 
-    print("1. Đang load dữ liệu gốc (Đọc theo từng chunk để tránh Out of Memory)...")
-    
-    chunk_list = []
-    initial_len = 0
-    
-    try:
-        for chunk in pd.read_csv(CSV_PATH, chunksize=100000):
-            chunk.columns = chunk.columns.str.strip()
-            initial_len += len(chunk)
-            
-            if LABEL_COL in chunk.columns:
-                chunk = chunk[chunk[LABEL_COL] != "Suspicious"]
-                
-            chunk_list.append(chunk)
-            
-        df_raw = pd.concat(chunk_list, ignore_index=True)
-        # Giải phóng list tạm ngay lập tức
-        del chunk_list 
-        gc.collect()
-        
-    except FileNotFoundError:
-        print(f"❌ LỖI: Không tìm thấy file {CSV_PATH}")
-        exit(1)
+    print("1. Loading data...")
+    df = pd.read_csv(CSV_PATH)
+    df.columns = df.columns.str.strip()
 
-    if LABEL_COL in df_raw.columns:
-        print(f"   Đã xóa {initial_len - len(df_raw):,} dòng 'Suspicious'. Còn lại {len(df_raw):,} dòng.")
+    df = df[df[LABEL_COL] != "Suspicious"]
 
-    drop = [c for c in DROP_COLS if c in df_raw.columns]
-    if drop:
-        df_raw = df_raw.drop(columns=drop)
+    df = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
 
-    df_raw = engineer_ddos_features(df_raw)
+    df = engineer_ddos_features(df)
 
-    print("\n2. Khởi tạo ma trận dữ liệu (Ép kiểu Float32 để giảm 50% RAM)...")
+    print("2. Preparing matrix...")
 
-    labels_raw = df_raw[LABEL_COL].values
-    if isinstance(labels_raw[0], str):
-        enc = {l: i for i, l in enumerate(np.unique(labels_raw))}
-        y_work = np.array([enc[l] for l in labels_raw], dtype=np.int32)
-    else:
-        y_work = labels_raw.astype(np.int32)
+    y_raw = df[LABEL_COL].values
+    enc = {l: i for i, l in enumerate(np.unique(y_raw))}
+    y = np.array([enc[l] for l in y_raw], dtype=np.int32)
 
-    feature_cols = [c for c in df_raw.columns if c != LABEL_COL]
+    feature_cols = [c for c in df.columns if c != LABEL_COL]
 
-    # CẤP PHÁT MA TRẬN NUMPY TRỰC TIẾP (Bỏ qua việc copy DataFrame)
-    X_work = np.zeros((len(df_raw), len(feature_cols)), dtype=np.float32)
+    X = np.zeros((len(df), len(feature_cols)), dtype=np.float32)
 
-    print("   -> Đang xử lý từng cột dữ liệu...")
     for i, col in enumerate(feature_cols):
-        # Chuyển đổi an toàn, điền NaN/Inf bằng 0
-        col_data = pd.to_numeric(df_raw[col], errors='coerce').astype(np.float32)
+        col_data = pd.to_numeric(df[col], errors='coerce')
         col_data = col_data.replace([np.inf, -np.inf], np.nan).fillna(0)
-        X_work[:, i] = col_data.values
+        X[:, i] = col_data.astype(np.float32)
 
-    # Dọn dẹp biến tạm
-    del col_data
+    print("3. Running Feature Selection...")
+
+    fs = FeatureSelector(top_k=TOP_K)
+    _, selected = fs.fit_transform(X, y, feature_cols)
+
+    # cleanup
+    del X
     gc.collect()
 
-    # 3. Chạy Feature Selection
-    print("\n3. Đang chạy thuật toán học máy Feature Selection...")
-    fs = FeatureSelector(top_k=TOP_K, cv_folds=5)
-    _, selected_features = fs.fit_transform(X_work, y_work, feature_cols)
-
-    # Giải phóng ma trận numpy khổng lồ sau khi hoàn tất
-    del X_work
-    gc.collect()
-
+    # save feature list
     with open("selected_features.txt", "w") as f:
-        f.write("\n".join(selected_features))
-    
-    # ------------------------------------------------------------------
-    # 4. XUẤT CSV TỪ DỮ LIỆU GỐC
-    # ------------------------------------------------------------------
-    print("\n4. Đang tạo file Dataset mới từ dữ liệu GỐC...")
-    final_cols = selected_features + [LABEL_COL]
-    
-    # Lọc lại từ df_raw (giữ nguyên gốc)
-    df_final = df_raw[final_cols]
-    
-    OUTPUT_CSV = "dataset_ready_for_model.csv"
-    df_final.to_csv(OUTPUT_CSV, index=False)
-    
-    print(f"✓ Hoàn tất! Đã trích xuất đúng {len(selected_features)} cột.")
-    print(f"✓ Lưu tại: {OUTPUT_CSV} (Tổng số dòng: {len(df_final):,})")
+        f.write("\n".join(selected))
+
+    # export RAW data
+    print("4. Exporting dataset...")
+
+    df_final = df[selected + [LABEL_COL]]
+    df_final.to_csv("dataset_ready.csv", index=False)
+
+    print("✓ DONE")

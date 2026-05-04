@@ -47,24 +47,36 @@ def prepare_final_data(df: pd.DataFrame, selected_features: list, label_col: str
     
     missing_count = df_clean[selected_features].isna().sum().sum()
     if missing_count > 0:
-        print(f"   -> Đang lấp đầy {missing_count:,} giá trị NaN/Inf (Sử dụng Median cho IAT, 0 cho đếm/tỉ lệ)...")
-        
-        # Phân loại logic fill NaN thông minh hơn
+        # ⚠️  QUAN TRỌNG: Dùng 0 cho TẤT CẢ (kể cả IAT/duration).
+        # Lý do: IAT features chứa mixed data (duration thực ~µs lẫn Unix timestamp ~1.7e9).
+        # Nếu fill median sẽ inject giá trị timestamp vào các hàng NaN → nhiễm loạn group anomaly.
+        # Tokenizer sẽ xử lý đúng: 0 → giữ nguyên trong zero_heavy / anomaly group.
+        print(f"   -> Đang lấp đầy {missing_count:,} giá trị NaN/Inf bằng 0 (bao gồm IAT/duration)...")
         for col in selected_features:
             if df_clean[col].isna().any():
-                if "iat" in col.lower() or "duration" in col.lower() or "time" in col.lower():
-                    # Điền Median cho các cột thời gian
-                    fill_val = df_clean[col].median()
-                else:
-                    # Điền 0 cho các cột đếm, flags, rates
-                    fill_val = 0.0
-                
-                df_clean[col] = df_clean[col].fillna(fill_val)
+                df_clean[col] = df_clean[col].fillna(0.0)
 
-    mapping = {}
+    # =====================================================================
+    # 🌟 BƯỚC LÀM SẠCH TIMESTAMPS TRONG IAT FEATURES
+    # =====================================================================
+    # Các features IAT đôi khi chứa Unix timestamp (~1.7e9 giây)
+    # thay vì duration thực (~µs đến giây) khi flow chỉ có 1 packet.
+    # Phải reset về 0 NGAY TẠI ĐÂY – trước khi select_dta.py tính
+    # engineered features (iat_x_rate, bwd_fwd_ratio) sử dụng chúng.
+    _TIMESTAMP_THRESHOLD = 1e8  # IAT hợp lệ không bao giờ vượt quá 1e8 giây (~3.17 năm)
+    _iat_cols = [c for c in selected_features if "iat" in c.lower()]
+    _cleaned_ts = []
+    for col in _iat_cols:
+        if col in df_clean.columns:
+            mask_ts = df_clean[col] > _TIMESTAMP_THRESHOLD
+            if mask_ts.any():
+                df_clean.loc[mask_ts, col] = 0.0
+                _cleaned_ts.append(f"{col}({mask_ts.sum():,})")
+    if _cleaned_ts:
+        print(f"   -> [Timestamp Clean] Reset timestamp → 0 trong: {_cleaned_ts}")
+    # =====================================================================
+
     if df_clean[label_col].dtype == 'object':
-        labels_uni = df_clean[label_col].unique()
-        mapping = {str(k): str(k) for k in labels_uni}
         print(f"   -> Giữ nguyên cột nhãn gốc '{label_col}' để tokenizer và start.py dùng.")
 
     print("[Data Preparation] Hoàn tất! Dữ liệu đã sạch và sẵn sàng 100% dạng số.")
@@ -76,7 +88,7 @@ def prepare_final_data(df: pd.DataFrame, selected_features: list, label_col: str
 if __name__ == "__main__":
     t0 = time.time()
     
-    INPUT_CSV = "dataset_grouped.csv"
+    INPUT_CSV = "multilabels.csv"
     OUTPUT_CSV = "dataset_optimized.csv"
     LABEL_COL = "activity" # Đổi tên nếu cột nhãn của bạn khác
 

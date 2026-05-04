@@ -92,9 +92,8 @@ class FocalLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(reduction='none', label_smoothing=label_smoothing)
 
     def forward(self, inputs, targets):
-        ce_loss_raw = nn.functional.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss_raw)
-        ce_loss = self.ce(inputs, targets)
+        ce_loss = self.ce(inputs, targets)          # single CE (with label_smoothing)
+        pt = torch.exp(-ce_loss)                     # consistent pt
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
         
         if self.weight is not None:
@@ -113,164 +112,93 @@ class FocalLoss(nn.Module):
 class PLEValueEmbedding(nn.Module):
     """
     Piecewise Linear Encoding (PLE) — Monotonic value embedding.
-
-    ── Why monotonic? ───────────────────────────────────────────
-    Standard nn.Embedding maps token IDs to arbitrary vectors:
-      token 16468 and token 16469 may point to completely unrelated rows.
-    PLE guarantees: if  token_A < token_B  then  f(token_A)  and  f(token_B)
-    are "geometrically close" and ordered — adjacent token IDs produce
-    smoothly varying vectors, preserving the rank structure of the data.
-
-    ── Algorithm ────────────────────────────────────────────────
-    Given num_bins B and n_segments T:
-
-      1. Normalise:  t = token_id / (B - 1)   ∈ [0, 1]
-         Example: token 24703, B=30001 → t = 0.82342…
-
-      2. PLE encode  t → ℝ^T  (monotone piecewise-linear):
-         Divide [0,1] into T equal segments of width w = 1/T.
-         For segment i:  fill[i] = clamp( (t - i·w) / w,  0, 1 )
-         → segments fully below t are 1.0,
-           the current segment is fractional,
-           segments above t are 0.0.
-         This vector is non-decreasing in t  ✓
-
-      3. Project:   proj(ℝ^T → ℝ^value_dim)  (learned linear layer)
-
-    ── Example trace (duration) ─────────────────────────────────
-      raw value  : 694 250.49
-      quantile   : 0.823 423 42
-      × 30 000   : 24 702.70  → round → token 24 703
-      t          : 24703 / 30000 = 0.82343…
-      PLE(t)     : [1,1,…,1, 0.8…, 0, 0, …, 0]  ← T-dim
-      proj(PLE)  : (V1, V2, …, V_value_dim)
     """
     def __init__(self, num_bins: int, value_dim: int, n_segments: int = None):
         super().__init__()
         self.num_bins   = max(num_bins, 1)
         self.value_dim  = value_dim
-        # n_segments = granularity of the piecewise encoding
-        # More segments → finer resolution; default = value_dim
         self.n_segments = n_segments if n_segments is not None else value_dim
-
-        # Learned projection: ℝ^n_segments → ℝ^value_dim
         self.proj = nn.Linear(self.n_segments, value_dim, bias=True)
         nn.init.xavier_uniform_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
     def _ple_encode(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        t : float tensor of shape (*)  with values in [0, 1]
-        Returns : tensor of shape (*, n_segments) — monotone in t
-        """
         T   = self.n_segments
         w   = 1.0 / T
-        # left boundary of each segment: 0, w, 2w, …, (T-1)w
-        left = torch.arange(T, dtype=torch.float32, device=t.device) * w  # (T,)
-        # broadcast: t (...,1) - left (T,)  → (..., T)
-        fill = ((t.unsqueeze(-1) - left) / w).clamp(0.0, 1.0)             # (..., T)
+        left = torch.arange(T, dtype=torch.float32, device=t.device) * w
+        fill = ((t.unsqueeze(-1) - left) / w).clamp(0.0, 1.0)
         return fill
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """
-        token_ids : (B, F)  int64
-        Returns   : (B, F, value_dim)
-        """
-        t   = token_ids.float() / (self.num_bins - 1)   # (B, F) in [0,1]
-        ple = self._ple_encode(t)                        # (B, F, n_segments)
-        return self.proj(ple)                            # (B, F, value_dim)
+        t   = token_ids.float() / (self.num_bins - 1)
+        ple = self._ple_encode(t)
+        return self.proj(ple)
 
 
 class MonotonicTabularEmbedding(nn.Module):
-    """
-    Full per-row embedding (Step 2 + 3 of the pipeline spec).
-
-    Each feature produces one token vector:
-      v_value   = PLEValueEmbedding(token_id)   → ℝ^value_dim   [monotonic]
-      v_feature = FeatureEmbedding(feature_id)  → ℝ^feat_dim    [learned identity]
-      v_out     = concat(v_value, v_feature)    → ℝ^(value_dim + feat_dim)
-
-    One row of F features → matrix of shape (F, embed_dim) = sequence of tokens.
-
-    Example (80 features, value_dim=224, feat_dim=64 → embed_dim=288):
-      duration token 24703 → PLE → proj → (V1…V224)
-      feature 'duration' (col 5)  → feat_emb → (W225…W288)
-      → token vector = (V1…V224, W225…W288)
-    """
     def __init__(self, num_features: int, num_bins: int,
                  value_dim: int, feat_dim: int, n_segments: int = None):
         super().__init__()
         self.num_features = num_features
-
-        # Monotonic value embedding (PLE)
         self.value_embedding = PLEValueEmbedding(num_bins, value_dim, n_segments)
-
-        # Column-identity embedding (standard learned, non-positional)
         self.feature_embedding = nn.Embedding(num_features, feat_dim)
         nn.init.trunc_normal_(self.feature_embedding.weight, std=0.02)
 
     def forward(self, x_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        x_tokens : (B, F)  int64 token IDs
-        Returns  : (B, F, value_dim + feat_dim)
-        """
-        # Value branch — monotonic
-        val_emb  = self.value_embedding(x_tokens)                          # (B, F, value_dim)
-
-        # Feature branch — column identity
+        val_emb  = self.value_embedding(x_tokens)
         feat_idx = torch.arange(self.num_features, device=x_tokens.device)
-        feat_emb = self.feature_embedding(feat_idx).unsqueeze(0)          # (1, F, feat_dim)
-        feat_emb = feat_emb.expand(x_tokens.size(0), -1, -1)             # (B, F, feat_dim)
-
-        # Concatenate: v_out = v_value || v_feature
-        return torch.cat([val_emb, feat_emb], dim=-1)                     # (B, F, embed_dim)
+        feat_emb = self.feature_embedding(feat_idx).unsqueeze(0)
+        feat_emb = feat_emb.expand(x_tokens.size(0), -1, -1)
+        return torch.cat([val_emb, feat_emb], dim=-1)
 
 
 class MultiHeadAttentionGrid(nn.Module):
+    """
+    Parameterized Multi-Head Attention:
+
+        head_i = softmax( Q Aᵢ Qᵀ / √d_k ) V
+
+    Thay vì dùng W^Q_i và W^K_i riêng biệt mỗi head (chuẩn MHA),
+    ở đây dùng:
+      - 1 projection Q chung: Q = X W^Q          shape (N, H, S, d_k)
+      - Ma trận Aᵢ học được per-head:            shape (H, d_k, d_k)
+      - scores_i = Q_i @ Aᵢ @ Q_iᵀ / √d_k      shape (N, H, S, S)
+      - V = X W^V vẫn giữ nguyên
+
+    Lợi ích: Aᵢ học cách hai token tương tác mà không cần key riêng,
+    giảm tham số (bỏ W^K) và cho phép các heads học các "interaction basis"
+    khác nhau qua Aᵢ.
+    """
     def __init__(self, embed_dim, num_heads, dropout=0.1):
         super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim phải chia hết cho num_heads"
-        
-        self.d_model = embed_dim
+        assert embed_dim % num_heads == 0
         self.num_heads = num_heads
-        self.d_k = embed_dim // num_heads 
-        
+        self.d_k       = embed_dim // num_heads
+        self.d_model   = embed_dim
         self.W_q = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.W_k = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.A   = nn.Parameter(torch.empty(num_heads, self.d_k, self.d_k))
         self.W_v = nn.Linear(embed_dim, embed_dim, bias=True)
         self.W_o = nn.Linear(embed_dim, embed_dim, bias=True)
         self.attn_drop = nn.Dropout(dropout)
-        
-        self._reset_parameters()
 
-    def _reset_parameters(self):
-        nn.init.xavier_uniform_(self.W_q.weight)
-        nn.init.xavier_uniform_(self.W_k.weight)
-        nn.init.xavier_uniform_(self.W_v.weight)
-        nn.init.xavier_uniform_(self.W_o.weight)
-        if self.W_q.bias is not None:
-            nn.init.zeros_(self.W_q.bias)
-            nn.init.zeros_(self.W_k.bias)
-            nn.init.zeros_(self.W_v.bias)
-            nn.init.zeros_(self.W_o.bias)
+        nn.init.xavier_uniform_(self.W_q.weight); nn.init.zeros_(self.W_q.bias)
+        nn.init.xavier_uniform_(self.W_v.weight); nn.init.zeros_(self.W_v.bias)
+        nn.init.xavier_uniform_(self.W_o.weight); nn.init.zeros_(self.W_o.bias)
+        for i in range(num_heads):
+            nn.init.eye_(self.A[i])
 
     def forward(self, x):
-        batch_size, seq_len, _ = x.size()
-        
-        Q = self.W_q(x) 
-        K = self.W_k(x)
-        V = self.W_v(x)
-        
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
-        
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        attention_weights = self.attn_drop(torch.softmax(scores, dim=-1))
-        context = torch.matmul(attention_weights, V)
-        
-        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        return self.W_o(context)
+        N, S, _ = x.size()
+        H, dk   = self.num_heads, self.d_k
+        Q = self.W_q(x).view(N, S, H, dk).transpose(1, 2)   
+        V = self.W_v(x).view(N, S, H, dk).transpose(1, 2)   
+        QA     = torch.einsum('nhsd,hde->nhse', Q, self.A)   
+        scores = torch.matmul(QA, Q.transpose(-2, -1)) / math.sqrt(dk) 
+        weights = self.attn_drop(torch.softmax(scores, dim=-1))
+        ctx     = torch.matmul(weights, V) 
+        ctx     = ctx.transpose(1, 2).contiguous().view(N, S, self.d_model)
+        return self.W_o(ctx)
+
 
 
 class MoEAttention(nn.Module):
@@ -278,35 +206,40 @@ class MoEAttention(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        
+
         self.experts = nn.ModuleList([
-            MultiHeadAttentionGrid(embed_dim, num_heads_per_expert, dropout) 
+            MultiHeadAttentionGrid(embed_dim, num_heads_per_expert, dropout)
             for _ in range(num_experts)
         ])
-        self.router = nn.Linear(embed_dim, num_experts)
-        
+
+        self.router_norm = nn.LayerNorm(embed_dim)
+        self.router      = nn.Linear(embed_dim, num_experts, bias=False)
+        nn.init.normal_(self.router.weight, std=0.01)
+
+        self.routing_probs = None
+        self.router_z_loss = None
+
     def forward(self, x):
-        B, T, D = x.size()
-        
-        router_logits = self.router(x)
+        B, F, D = x.size()
+        router_input = self.router_norm(x.mean(dim=1))           
+        clean_logits = self.router(router_input)                   
+        self.routing_probs = torch.softmax(clean_logits, dim=-1)           
+        self.router_z_loss = clean_logits.logsumexp(dim=-1).pow(2).mean() 
+        router_logits = clean_logits
         if self.training:
-            noise = torch.randn_like(router_logits) * 0.1
-            router_logits = router_logits + noise
-            
-        top_k_weights, top_k_indices = torch.topk(router_logits, self.top_k, dim=-1)
-        top_k_weights = torch.softmax(top_k_weights, dim=-1) 
-        
-        final_output = torch.zeros_like(x)
-        
+            router_logits = router_logits + torch.randn_like(router_logits) * 0.1
+        top_k_weights, top_k_indices = torch.topk(router_logits, self.top_k, dim=-1)  
+        top_k_weights = torch.softmax(top_k_weights, dim=-1)                          
+        final_output = torch.zeros_like(x)                         
         for i in range(self.num_experts):
-            expert_mask = (top_k_indices == i).any(dim=-1) 
-            
-            if expert_mask.any():
-                expert_out = self.experts[i](x)
-                weight_mask = (top_k_indices == i) 
-                expert_weights = (top_k_weights * weight_mask).sum(dim=-1) 
-                final_output += expert_out * expert_weights.unsqueeze(-1)
-                
+            mask = (top_k_indices == i).any(dim=-1)               
+            if not mask.any():
+                continue
+            expert_out  = self.experts[i](x[mask])                 
+            weight_mask = (top_k_indices[mask] == i)               
+            expert_w    = (top_k_weights[mask] * weight_mask).sum(dim=-1) 
+            final_output[mask] += expert_out * expert_w.unsqueeze(-1).unsqueeze(-1)
+
         return final_output
 
 
@@ -343,27 +276,12 @@ class MoETransformerBlock(nn.Module):
 
 
 class Deep_MoE_Tabular(nn.Module):
-    """
-    Steps 3 & 4 — Row Representation + Model Input
-
-    Each feature → one token vector: PLE(value) || Embedding(feature_id)
-    One row      → matrix of shape (F, embed_dim)    ← sequence of F tokens
-    Matrix       → 4-layer MoE Transformer (attention across feature tokens)
-
-    Embedding breakdown:
-      value_dim  : dimension of PLE value embedding  (monotonic)
-      feat_dim   : dimension of column-identity embedding
-      embed_dim  = value_dim + feat_dim  (= transformer d_model)
-      n_segments : PLE resolution (default = value_dim)
-    """
     def __init__(self, num_numeric_features, num_bins,
                  value_dim=224, feat_dim=64, n_segments=None,
                  num_layers=4, num_experts=4, num_heads_per_expert=4, top_k=2,
                  num_classes=5, mlp_dropout=0.4):
         super().__init__()
-        embed_dim = value_dim + feat_dim   # total d_model for transformer
-
-        # Monotonic tabular embedding (PLE value + learned feature identity)
+        embed_dim = value_dim + feat_dim 
         self.feature_embedder = MonotonicTabularEmbedding(
             num_features = num_numeric_features,
             num_bins     = num_bins,
@@ -372,16 +290,12 @@ class Deep_MoE_Tabular(nn.Module):
             n_segments   = n_segments,
         )
         self.input_norm = nn.LayerNorm(embed_dim)
-
-        # N MoE Transformer layers
         self.layers = nn.ModuleList([
             MoETransformerBlock(embed_dim, num_experts, num_heads_per_expert, top_k, mlp_dropout)
             for _ in range(num_layers)
         ])
-
         self.final_norm = nn.LayerNorm(embed_dim)
-
-        # Pooling: mean + max → classifier
+        self.attn_pool_w = nn.Linear(embed_dim, 1)
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim * 2, embed_dim),
             nn.GELU(),
@@ -392,19 +306,29 @@ class Deep_MoE_Tabular(nn.Module):
             nn.Linear(embed_dim // 2, num_classes)
         )
 
-    def forward(self, tokenized_x):
-        # tokenized_x: (B, F) int64 token IDs
-        x = self.feature_embedder(tokenized_x)   # (B, F, embed_dim)
-        x = self.input_norm(x)
+    def get_lb_loss(self, lb_coeff=0.01, z_coeff=0.001):
+        lb = torch.tensor(0.0, device=next(self.parameters()).device)
+        zl = torch.tensor(0.0, device=next(self.parameters()).device)
+        for layer in self.layers:
+            attn = layer.attention
+            if attn.routing_probs is not None:
+                mean_probs = attn.routing_probs.mean(dim=0)
+                E = attn.num_experts
+                lb = lb + E * (mean_probs * mean_probs).sum()
+            if attn.router_z_loss is not None:
+                zl = zl + attn.router_z_loss
+        return lb_coeff * lb + z_coeff * zl
 
+    def forward(self, tokenized_x):
+        x = self.feature_embedder(tokenized_x)
+        x = self.input_norm(x)
         for layer in self.layers:
             x = layer(x)
-
         x = self.final_norm(x)
-
-        mean_pooled = x.mean(dim=1)
+        attn_w = torch.softmax(self.attn_pool_w(x), dim=1)
+        attn_pooled = (x * attn_w).sum(dim=1)
         max_pooled, _ = x.max(dim=1)
-        pooled = torch.cat([mean_pooled, max_pooled], dim=1)
+        pooled = torch.cat([attn_pooled, max_pooled], dim=1)
 
         return self.classifier(pooled)
 
@@ -444,6 +368,11 @@ class Trainer:
                 with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=device_type=='cuda'):
                     logits = self.model(num_x)
                     loss = self.criterion(logits, lbl)
+                    # Load-balancing auxiliary loss (encourages uniform expert usage)
+                    if train and hasattr(self.model, 'get_lb_loss'):
+                        lb_coeff = getattr(self, '_lb_coeff', 0.01)
+                        z_coeff  = getattr(self, '_z_coeff',  0.001)
+                        loss = loss + self.model.get_lb_loss(lb_coeff=lb_coeff, z_coeff=z_coeff)
 
                 if train:
                     if self.scaler is not None:
@@ -469,9 +398,10 @@ class Trainer:
                 trues.extend(lbl.cpu().numpy())
 
         avg_loss = total_loss / len(loader)
-        acc = accuracy_score(trues, preds)
-        f1 = f1_score(trues, preds, average='weighted', zero_division=0)
-        return avg_loss, acc, f1, preds, trues
+        acc  = accuracy_score(trues, preds)
+        f1_w = f1_score(trues, preds, average='weighted', zero_division=0)
+        f1_m = f1_score(trues, preds, average='macro',    zero_division=0)
+        return avg_loss, acc, f1_w, f1_m, preds, trues
 
     def fit(self, train_loader, val_loader, epochs=50, patience=7):
         print(f"\n{'='*80}\n{'BẮT ĐẦU HUẤN LUYỆN':^80}\n{'='*80}\n")
@@ -479,14 +409,14 @@ class Trainer:
 
         for epoch in range(1, epochs + 1):
             t0 = time.time()
-            tr_loss, tr_acc, tr_f1, _, _ = self._run_epoch(train_loader, train=True)
+            tr_loss, tr_acc, tr_f1w, tr_f1m, _, _ = self._run_epoch(train_loader, train=True)
             backup = None
             backup_buf = None
             if self.ema is not None:
                 backup = {n: p.detach().clone() for n, p in self.model.named_parameters() if p.requires_grad}
                 backup_buf = {n: b.detach().clone() for n, b in self.model.named_buffers()}
                 self.ema.copy_to_model(self.model)
-            va_loss, va_acc, va_f1, _, _ = self._run_epoch(val_loader, train=False)
+            va_loss, va_acc, va_f1w, va_f1m, _, _ = self._run_epoch(val_loader, train=False)
             if backup is not None:
                 for name, p in self.model.named_parameters():
                     if name in backup:
@@ -495,22 +425,29 @@ class Trainer:
                     if name in backup_buf:
                         b.data.copy_(backup_buf[name])
 
-            if self.scheduler and not self.scheduler_per_batch: 
+            if self.scheduler and not self.scheduler_per_batch:
                 self.scheduler.step(va_loss)
 
             current_lr = self.optimizer.param_groups[0]['lr']
             mlflow.log_metrics({
-                "train_loss": tr_loss, "train_acc": tr_acc, "train_f1": tr_f1,
-                "val_loss": va_loss, "val_acc": va_acc, "val_f1": va_f1,
-                "learning_rate": current_lr
+                "train_loss": tr_loss,  "train_acc": tr_acc,
+                "train_f1_weighted": tr_f1w, "train_f1_macro": tr_f1m,
+                "val_loss": va_loss,    "val_acc": va_acc,
+                "val_f1_weighted": va_f1w,   "val_f1_macro": va_f1m,
+                "learning_rate": current_lr,
             }, step=epoch)
 
             elapsed = time.time() - t0
-            mark = " ✦" if va_f1 > self.best_val_f1 else ""
-            print(f"Epoch {epoch:03d}/{epochs} | Train Loss: {tr_loss:.4f} | Val Loss: {va_loss:.4f} Val F1: {va_f1:.4f} | {elapsed:.1f}s{mark}")
+            # ✅ Dùng macro F1 làm tiêu chí early-stopping
+            # Weighted F1 bị dominant bởi class đa số → bỏ sót minority DDoS classes
+            mark = " ✦" if va_f1m > self.best_val_f1 else ""
+            print(f"Epoch {epoch:03d}/{epochs} | "
+                  f"Train Loss: {tr_loss:.4f} | "
+                  f"Val Loss: {va_loss:.4f}  Val F1-w: {va_f1w:.4f}  Val F1-m: {va_f1m:.4f} | "
+                  f"{elapsed:.1f}s{mark}")
 
-            if va_f1 > self.best_val_f1:
-                self.best_val_f1 = va_f1
+            if va_f1m > self.best_val_f1:
+                self.best_val_f1 = va_f1m
                 self.best_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
                 if self.ema is not None:
                     self.best_ema_state = self.ema.state_dict()
@@ -518,26 +455,35 @@ class Trainer:
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"\n⚠️ Early stopping tại epoch {epoch} (patience={patience})")
+                    print(f"\n⚠️ Early stopping tại epoch {epoch} (patience={patience}, metric=macro_F1)")
                     break
 
-        print(f"\n✓ Nạp lại best checkpoint (val F1 = {self.best_val_f1:.4f})")
+        print(f"\n✓ Nạp lại best checkpoint (val Macro-F1 = {self.best_val_f1:.4f})")
         if self.ema is not None and self.best_ema_state is not None:
             self.ema.load_state_dict(self.best_ema_state)
             self.ema.copy_to_model(self.model)
-            print("   -> Đã áp dụng trọng số EMA tương ứng best val F1.")
+            print("   -> Đã áp dụng trọng số EMA tương ứng best val Macro-F1.")
         elif self.best_model_state is not None:
             self.model.load_state_dict(self.best_model_state)
 
     def evaluate(self, val_loader, target_names=None):
         print("\nĐang đánh giá mô hình cuối cùng...")
-        _, acc, f1, preds, trues = self._run_epoch(val_loader, train=False)
+        _, acc, f1w, f1m, preds, trues = self._run_epoch(val_loader, train=False)
         print("\nClassification Report:")
+        report = classification_report(
+            trues, preds, target_names=target_names,
+            zero_division=0, output_dict=True
+        )
         print(classification_report(trues, preds, target_names=target_names, zero_division=0))
         print("Confusion Matrix:")
         print(confusion_matrix(trues, preds))
-        print(f"\n   Accuracy: {acc:.4f} | Weighted F1: {f1:.4f}")
-        return acc, f1
+        print(f"\n   Accuracy: {acc:.4f} | Weighted F1: {f1w:.4f} | Macro F1: {f1m:.4f}")
+        # Log per-class F1 vào MLflow để dễ debug minority class
+        if target_names:
+            for cls in target_names:
+                if cls in report:
+                    mlflow.log_metric(f"f1_{cls}", round(report[cls]['f1-score'], 4))
+        return acc, f1m
         
     def export_misclassified_to_txt(self, loader, target_names, filepath="misclassified_samples.txt"):
         print(f"\nĐang trích xuất các mẫu dự đoán sai ra file: {filepath} ...")
@@ -622,30 +568,27 @@ if __name__ == "__main__":
     # BƯỚC 3: CẤU HÌNH MLFLOW VÀ MODEL DEEP 4-LAYER
     # ---------------------------------------------------------
     config = {
-        # ── Embedding ───────────────────────────────────────────────
-        # value_dim + feat_dim = embed_dim (transformer d_model)
-        "VALUE_DIM":  224,     # PLE value embedding dimension
-        "FEAT_DIM":    64,     # column-identity embedding dimension
-        # N_SEGMENTS: PLE piecewise resolution (= number of linear segments)
-        # Higher → finer monotonic resolution. Default = VALUE_DIM.
+
+        "VALUE_DIM":  224,     
+        "FEAT_DIM":    64,     
         "N_SEGMENTS": 224,
-        # ── Transformer ─────────────────────────────────────────────
-        "NUM_LAYERS": 4,               # 4 Block tuần tự
-        "NUM_EXPERTS": 4,              # 4 nhánh dây (experts)
-        "NUM_HEADS_PER_EXPERT": 4,     # 4 heads/nhánh (Tổng: 16 heads)
-        "TOP_K_ROUTING": 2,            # Lấy 2 chuyên gia tốt nhất cho mỗi token
-        # ── Training ────────────────────────────────────────────────
+        "NUM_LAYERS": 4,               
+        "NUM_EXPERTS": 4,              
+        "NUM_HEADS_PER_EXPERT": 4,     
+        "TOP_K_ROUTING": 2,            
         "BATCH_SIZE": BATCH_SIZE,
-        "EPOCHS": 30,
-        "PATIENCE": 5,
+        "EPOCHS": 50,
+        "PATIENCE": 12,          # tăng từ 8 → cho model thêm thời gian thoát plateau
         "MAX_LR": 1e-3,
         "WEIGHT_DECAY": 1e-2,
-        "MLP_DROPOUT": 0.3,
-        "NUM_BINS": NUM_BINS,          # auto-detected vocab size from tokenizer
-        "LABEL_SMOOTHING": 0.05,
+        "MLP_DROPOUT": 0.2,      # giảm từ 0.3 → giảm underfitting minority classes
+        "NUM_BINS": NUM_BINS,          
+        "LABEL_SMOOTHING": 0.0,
         "EMA_DECAY": 0.9992,
-        "FOCAL_GAMMA": 1.0,
-        "GRAD_CLIP": 1.0
+        "FOCAL_GAMMA": 2.0,
+        "GRAD_CLIP": 1.0,
+        "LB_LOSS_COEFF": 0.01,
+        "Z_LOSS_COEFF":  0.001,
     }
 
     mlflow.set_tracking_uri("sqlite:///mlruns.db")
@@ -674,13 +617,23 @@ if __name__ == "__main__":
             mlp_dropout          = config["MLP_DROPOUT"]
         ).to(device)
 
-        class_w = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
-        class_w = np.power(class_w, 0.5)
+        samples_per_class = np.bincount(y_train).astype(float)
+        # inv-sqrt weighting + soft cap (max 15× min)
+        # - inv-sqrt: smoothơn inv-freq, tđ minority có lợi thế nhưng không quá cực đoan
+        # - soft cap 15×: tránh ratio 480:1 của inv-freq thuần mà không clip cưứng 0.5
+        class_w = 1.0 / np.sqrt(samples_per_class + 1e-8)
+        class_w = class_w / class_w.sum() * len(class_w)          # normalize mean=1
+        cap     = class_w.min() * 15.0                             # soft cap: max 15× min
+        class_w = np.minimum(class_w, cap)
+        class_w = class_w / class_w.sum() * len(class_w)          # renormalize
         class_weights = torch.FloatTensor(class_w).to(device)
+        print(f"   -> Class weights (inv-sqrt + soft-cap 15×):")
+        for tn, w in zip(target_names, class_w):
+            print(f"      {tn:35s}: {w:.3f}")
         
         criterion = FocalLoss(
-            weight=class_weights, 
-            gamma=config["FOCAL_GAMMA"], 
+            weight=class_weights,
+            gamma=config["FOCAL_GAMMA"],
             label_smoothing=config["LABEL_SMOOTHING"]
         )
         optimizer = torch.optim.AdamW(model.parameters(), lr=config["MAX_LR"], weight_decay=config["WEIGHT_DECAY"])
@@ -689,7 +642,7 @@ if __name__ == "__main__":
             max_lr=config["MAX_LR"],
             epochs=config["EPOCHS"],
             steps_per_epoch=len(train_loader),
-            pct_start=0.12,
+            pct_start=0.20,
             anneal_strategy="cos",
             div_factor=20.0,
             final_div_factor=250.0,
@@ -701,17 +654,21 @@ if __name__ == "__main__":
             model, criterion, optimizer, scheduler, device,
             scheduler_per_batch=True, ema=ema, grad_clip=config["GRAD_CLIP"]
         )
+        # Wire MoE auxiliary loss coefficients into Trainer
+        trainer._lb_coeff = config["LB_LOSS_COEFF"]
+        trainer._z_coeff  = config["Z_LOSS_COEFF"]
         trainer.fit(train_loader, val_loader, epochs=config["EPOCHS"], patience=config["PATIENCE"])
 
         print("\n--- Validation set ---")
-        val_acc, _ = trainer.evaluate(val_loader, target_names=target_names)
+        val_acc, val_f1m = trainer.evaluate(val_loader, target_names=target_names)
         mlflow.log_metric("final_val_acc", val_acc)
+        mlflow.log_metric("final_val_macro_f1", val_f1m)
 
         print("\n--- Test set (độc lập) ---")
-        test_acc, test_f1 = trainer.evaluate(test_loader, target_names=target_names)
+        test_acc, test_f1m = trainer.evaluate(test_loader, target_names=target_names)
         mlflow.log_metric("test_acc", test_acc)
-        mlflow.log_metric("test_weighted_f1", test_f1)
-        mlflow.log_metric("best_val_f1", trainer.best_val_f1)
+        mlflow.log_metric("test_macro_f1", test_f1m)
+        mlflow.log_metric("best_val_macro_f1", trainer.best_val_f1)
         
         model.cpu()
         mlflow.pytorch.log_model(model, "best_model")

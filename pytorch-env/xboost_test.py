@@ -7,7 +7,7 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 import time
 
 # 1. Load data
-input_file = "dataset_ultimate_3classes.csv"
+input_file = "dataset_tokenized.txt"
 print(f"Đang tải dữ liệu từ {input_file}...")
 df = pd.read_csv(input_file, low_memory=False)
 
